@@ -1,0 +1,14 @@
+{
+  "name": "Pit Wall",
+  "short_name": "Pit Wall",
+  "description": "Personal organiser — calendar, tasks, inbox and plans, work and personal in one place.",
+  "start_url": "./#/today",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0E0F10",
+  "theme_color": "#0E0F10",
+  "icons": [
+    { "src": "icons/icon.png", "sizes": "180x180", "type": "image/png" }
+  ]
+}
