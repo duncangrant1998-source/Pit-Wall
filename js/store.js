@@ -6,18 +6,21 @@ export let S = null;
 export function load() {
   try { S = JSON.parse(localStorage.getItem(KEY)); } catch (e) { S = null; }
   if (!S || S.v !== 1) { S = seed(); save(); }
+  if (!S.accounts) S.accounts = [];
+  if (!S.meta) S.meta = {};
   return S;
 }
 export function save() {
   try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) { /* storage full or blocked */ }
 }
-export function replaceAll(data) { S = data; save(); }
-export function reset() { S = seed(); save(); }
+export function replaceAll(data) { S = data; if (!S.accounts) S.accounts = []; if (!S.meta) S.meta = {}; save(); }
+export function reset() { const keep = S && S.accounts ? S.accounts : []; S = seed(); S.accounts = keep; save(); }
 export function blank() {
   return {
     v: 1, created: Date.now(),
     settings: { autoSwitch: true },
     tasks: [], events: [], waiting: [], notes: [], messages: [], weekends: [],
+    accounts: [], meta: {},
   };
 }
 export function removeSamples() {

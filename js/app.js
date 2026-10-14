@@ -1,8 +1,10 @@
-import { esc, uid, cap, today, addDays, diffDays, nowMin, hm, weekStart, fromISO, dayShort, dayLong, relDay, dur, durShort, icon, mk, WD, MONL } from './util.js';
+import { esc, uid, cap, iso, today, addDays, diffDays, nowMin, hm, weekStart, fromISO, dayShort, dayLong, relDay, dur, durShort, icon, mk, WD, MONL } from './util.js';
+import { G, loadG, saveG, call, syncAll, syncAccount, isSyncing, lastSync, syncErrors, parseLink, forgetAccount } from './google.js';
 import { S, load, save, replaceAll, reset, removeSamples, hasSamples, projects, projectNames, newTask, newEvent } from './store.js';
 import { parse, detectActions, resolveDay } from './parse.js';
 
 load();
+loadG();
 const app = document.getElementById('app');
 
 /* ---------- ui state (not saved) ---------- */
@@ -25,7 +27,60 @@ const byId = (arr, id) => arr.find((x) => x.id === id);
 const keepCtx = (c) => (x) => c === 'all' || x.ctx === c;
 const travelMins = (e) => (e.travel && e.travel.mins ? e.travel.mins[e.travel.mode] : null);
 const leaveAt = (e) => { const m = travelMins(e); return m == null ? null : e.start - (e.early || 0) - m; };
-const isVideo = (loc) => /video|zoom|teams|meet|call/i.test(loc || '');
+const isVideo = (loc) => /video|zoom|teams|meet|call|https?:/i.test(loc || '');
+const enc = encodeURIComponent;
+
+/* ---------- Google data merged with local data ---------- */
+function gEvents() {
+  const out = [];
+  for (const a of S.accounts) {
+    for (const g of (G.events[a.id] || [])) {
+      const cfg = (a.cals || {})[g.cal] || {};
+      if (cfg.show === false) continue;
+      const s = new Date(g.start), e = new Date(g.end);
+      const base = { title: g.title, ctx: cfg.ctx || a.ctx, location: g.location, g: { acct: a.id, cal: g.cal, eid: g.eid, origStart: g.start, calName: cfg.name || 'Google' } };
+      if (g.allDay) {
+        let d = iso(s); const last = addDays(iso(new Date(e.getTime() - 1)), 0);
+        for (let i = 0; i < 31 && d <= last; i++, d = addDays(d, 1)) out.push(Object.assign({ id: 'g:' + a.id + ':' + g.eid + ':' + d, date: d, start: 0, dur: 1440, allDay: true }, base));
+      } else {
+        const id = 'g:' + a.id + ':' + g.eid + ':' + s.getTime();
+        const meta = S.meta[id] || {};
+        out.push(Object.assign({ id, date: iso(s), start: s.getHours() * 60 + s.getMinutes(), dur: Math.max(5, Math.round((e - s) / 60000)), travel: meta.travel || { mode: 'drive', mins: {} }, early: meta.early ?? 5 }, base));
+      }
+    }
+  }
+  return out;
+}
+const allEvents = () => S.events.concat(gEvents());
+const timed = (list) => list.filter((e) => !e.allDay);
+const findEvent = (id) => allEvents().find((e) => e.id === id);
+function travelTarget(e) {
+  if (!e.g) { if (!e.travel) e.travel = { mode: 'drive', mins: {} }; return e; }
+  if (!S.meta[e.id]) S.meta[e.id] = { travel: { mode: 'drive', mins: {} }, early: 5 };
+  return S.meta[e.id];
+}
+function parseFrom(from) {
+  const m = String(from || '').match(/^\s*"?([^"<]*?)"?\s*<([^>]+)>/);
+  if (m) return { name: m[1].trim() || m[2], email: m[2] };
+  return { name: String(from || '').trim(), email: String(from || '').trim() };
+}
+function gMessages() {
+  const out = [];
+  for (const a of S.accounts) {
+    for (const t of (G.threads[a.id] || [])) {
+      const d = new Date(t.date), f = parseFrom(t.from), body = G.bodies[a.id + ':' + t.id];
+      out.push({ id: 'gm:' + a.id + ':' + t.id, type: 'email', who: f.name, from: f.email, subj: t.subj, body: body ? body.last : t.snippet, date: iso(d), time: d.getHours() * 60 + d.getMinutes(), ctx: a.ctx, unread: t.unread, missed: false, g: { acct: a.id, tid: t.id, count: t.count } });
+    }
+  }
+  return out;
+}
+const allMessages = () => S.messages.concat(gMessages());
+const findMsg = (id) => allMessages().find((m) => m.id === id);
+const acctById = (id) => S.accounts.find((a) => a.id === id);
+function ago(ts) { if (!ts) return 'never'; const m = Math.round((Date.now() - ts) / 60000); return m < 1 ? 'just now' : m < 60 ? m + ' min ago' : Math.round(m / 60) + ' h ago'; }
+function cleanBody(b) {
+  return String(b || '').split(/\r?\n(?:On .{5,200}wrote:|-{2,} ?Original Message|From: .+\r?\nSent: )/)[0].split(/\r?\n/).filter((l) => !/^>/.test(l)).join('\n').replace(/\n{3,}/g, '\n\n').trim();
+}
 
 function seg(items, active, action, cols, extra = '') {
   return `<div class="seg" role="group" ${extra} style="grid-template-columns:repeat(${cols || items.length},minmax(0,1fr))">${items.map((it) =>
@@ -35,7 +90,7 @@ const ctxSeg = (active, action) => seg([{ id: 'all', label: 'All' }, { id: 'work
 
 function tabbar(cur) {
   const tabs = [['today', 'Today', 'sun'], ['calendar', 'Calendar', 'cal'], ['tasks', 'Tasks', 'tasks'], ['inbox', 'Inbox', 'inbox'], ['more', 'More', 'grid']];
-  const unread = S.messages.filter((m) => m.unread || m.missed).length;
+  const unread = allMessages().filter((m) => m.unread || m.missed).length;
   return `<nav class="tabbar" aria-label="Sections">${tabs.map(([id, l, ic]) =>
     `<a class="tab" href="#/${id}" ${cur === id ? 'aria-current="page"' : ''}>${icon(ic)}${l}${id === 'inbox' && unread ? `<span class="badge">${unread}</span>` : ''}</a>`).join('')}</nav>`;
 }
@@ -66,12 +121,28 @@ function taskRow(t, o = {}) {
     ${right}</div>`;
 }
 
+function syncBanner() {
+  if (!S.accounts.length) return '';
+  const errs = syncErrors();
+  if (errs.length) return `<p class="banner" style="margin-top:6px;border-color:#6A3A2E;color:var(--alert)">Couldn’t reach ${esc(errs[0].acct.email || 'Google')}: ${esc(errs[0].error)}</p>`;
+  return `<p class="xs muted mono" style="padding-top:8px">${isSyncing() ? 'SYNCING…' : 'SYNCED ' + ago(lastSync()).toUpperCase()}</p>`;
+}
+function gTarget(ctx) {
+  const accts = S.accounts.filter((a) => a.writeCal && a.writeCal[ctx]);
+  const a = accts.find((x) => x.ctx === ctx) || accts[0];
+  if (!a) return null;
+  const id = a.writeCal[ctx];
+  return { acct: a, cal: id, name: (a.cals[id] && a.cals[id].name) || 'Google Calendar' };
+}
+
 /* ---------- views ---------- */
 const VIEWS = {};
 
 VIEWS.today = () => {
   const T = today(), nm = nowMin(), ctx = ui.ctx, keep = keepCtx(ctx);
-  const evs = S.events.filter((e) => e.date === T && keep(e)).sort((a, b) => a.start - b.start);
+  const dayAll = allEvents().filter((e) => e.date === T && keep(e));
+  const allDay = dayAll.filter((e) => e.allDay);
+  const evs = timed(dayAll).sort((a, b) => a.start - b.start);
   const past = evs.filter((e) => e.start + e.dur <= nm), upcoming = evs.filter((e) => e.start + e.dur > nm);
   const next = upcoming[0];
   const trip = upcoming.find((e) => e.start > nm && e.location && !isVideo(e.location) && leaveAt(e) != null && leaveAt(e) - nm < 360);
@@ -79,7 +150,7 @@ VIEWS.today = () => {
   let tripHTML = '';
   if (trip) {
     const lv = leaveAt(trip), late = lv <= nm;
-    tripHTML = `<a class="alertcard ${late ? 'late' : ''}" href="#/trip/${trip.id}">
+    tripHTML = `<a class="alertcard ${late ? 'late' : ''}" href="#/trip/${enc(trip.id)}">
       <span style="color:${late ? 'var(--alert)' : 'var(--pers)'}">${icon('car')}</span>
       <span class="grow stack g4"><span class="k">${late ? 'LEAVE NOW · ' + dur(nm - lv) + ' LATE' : 'LEAVE BY ' + hm(lv) + ' · IN ' + dur(lv - nm).toUpperCase()}</span>
       <span class="b small ellip">${esc(trip.title)} · ${dur(travelMins(trip))} ${trip.travel.mode}</span></span>${icon('right', 18, 2)}</a>`;
@@ -90,8 +161,8 @@ VIEWS.today = () => {
     const now = next.start <= nm;
     const lv = leaveAt(next);
     const action = next.location && !isVideo(next.location) && lv != null
-      ? `<a class="btn primary wide" href="#/trip/${next.id}">${icon('car', 18)}Leave by ${hm(lv)}</a>`
-      : `<button type="button" class="btn primary wide" data-a="openEvent" data-id="${next.id}">Details</button>`;
+      ? `<a class="btn primary wide" href="#/trip/${enc(next.id)}">${icon('car', 18)}Leave by ${hm(lv)}</a>`
+      : `<button type="button" class="btn primary wide" data-a="openEvent" data-id="${esc(next.id)}">Details</button>`;
     nextHTML = `<section class="card pad stack g14" aria-label="Next up">
       <div class="rowx between"><span class="eyebrow">${now ? 'Now · until ' + hm(next.start + next.dur) : 'Next up · in ' + dur(next.start - nm)}</span><span class="rowx g6 xs b t2">${mk(next.ctx)}${LABEL[next.ctx]}</span></div>
       <div class="stack g6"><span class="mono" style="font-size:44px;line-height:1;font-weight:500;letter-spacing:-.02em">${hm(next.start)}</span>
@@ -102,11 +173,11 @@ VIEWS.today = () => {
     nextHTML = `<section class="card pad stack g12"><span class="t2">Nothing else scheduled today.</span><a class="btn" href="#/plan">${icon('calplus', 18)}Plan your day</a></section>`;
   }
 
-  const msgs = S.messages.filter(keep);
+  const msgs = allMessages().filter(keep);
   const cnt = { email: msgs.filter((m) => m.type === 'email' && m.unread).length, text: msgs.filter((m) => m.type === 'text' && m.unread).length, call: msgs.filter((m) => m.type === 'call' && m.missed).length };
   const tile = (ic, n, label, alert) => `<a class="tile" href="#/inbox">${icon(ic, 20)}<span class="stack g4"><span class="num" ${alert && n ? 'style="color:var(--alert)"' : ''}>${n}</span><span class="xs muted">${label}</span></span></a>`;
 
-  const agenda = (e, isPast) => `<button type="button" class="agenda ${isPast ? 'past' : ''}" data-a="openEvent" data-id="${e.id}">
+  const agenda = (e, isPast) => `<button type="button" class="agenda ${isPast ? 'past' : ''}" data-a="openEvent" data-id="${esc(e.id)}">
     <span class="tm">${hm(e.start)}</span><span class="stack g4" style="min-width:0"><span class="rowx g8">${mk(e.ctx)}<span class="ttl ellip">${esc(e.title)}</span></span>
     <span class="sub">${dur(e.dur)}${e.location ? ' · ' + esc(e.location) : ''}</span></span></button>`;
 
@@ -123,6 +194,7 @@ VIEWS.today = () => {
       ${nextHTML}
       <section class="tiles" aria-label="Communications">${tile('mail', cnt.email, 'Unread email')}${tile('text', cnt.text, 'New texts')}${tile('phone', cnt.call, 'Missed calls', true)}</section>
       <section class="stack" aria-label="Schedule">${sectionHead('Schedule', '<a class="link" href="#/calendar">Calendar</a>')}
+        ${allDay.length ? `<div class="rowx g6" style="flex-wrap:wrap;padding:4px 0 8px">${allDay.map((e) => `<button type="button" class="tag" data-a="openEvent" data-id="${esc(e.id)}">${mk(e.ctx)}All day · ${esc(e.title)}</button>`).join('')}</div>` : ''}
         ${evs.length ? past.map((e) => agenda(e, true)).join('') + `<div class="nowline"><span class="nowtag">NOW ${hm(nm)}</span><span class="ln"></span></div>` + upcoming.map((e) => agenda(e, false)).join('') : '<p class="small muted" style="padding:6px 0">No events today.</p>'}
       </section>
       <section class="stack" aria-label="Due today">${sectionHead('Due today', '<span class="links"><a class="link" href="#/plan">Plan day</a><a class="link" href="#/tasks">All tasks</a></span>')}
@@ -146,21 +218,23 @@ VIEWS.calendar = () => {
   const day = ui.calDay, T = today(), nm = nowMin();
   const ws = weekStart(day), days = [0, 1, 2, 3, 4, 5, 6].map((i) => addDays(ws, i));
   const H = 56, START = 6 * 60, END = 24 * 60;
+  const ALL = allEvents();
+  const dayAllDay = ALL.filter((e) => e.date === day && e.allDay);
   const items = [
-    ...S.events.filter((e) => e.date === day).map((e) => ({ kind: 'e', o: e, s: e.start, e: e.start + Math.max(e.dur, 20) })),
+    ...timed(ALL).filter((e) => e.date === day).map((e) => ({ kind: 'e', o: e, s: e.start, e: e.start + Math.max(e.dur, 20) })),
     ...S.tasks.filter((t) => t.sched && t.sched.date === day).map((t) => ({ kind: 't', o: t, s: t.sched.start, e: t.sched.start + Math.max(t.est || 30, 20) })),
   ];
   layoutCols(items);
   const pos = (it) => `top:${(it.s - START) / 60 * H + 2}px;height:${Math.max((it.e - it.s) / 60 * H - 4, 22)}px;left:calc(56px + (100% - 56px) * ${it.col} / ${it.n});width:calc((100% - 56px) / ${it.n} - 4px)`;
   const blocks = items.map((it) => it.kind === 'e'
-    ? `<button type="button" class="tl-ev ${it.o.ctx}" style="${pos(it)}" data-a="openEvent" data-id="${it.o.id}"><span class="t">${mk(it.o.ctx)}<span class="ellip">${esc(it.o.title)}</span></span><span class="r">${hm(it.o.start)}–${hm(it.o.start + it.o.dur)}</span></button>`
+    ? `<button type="button" class="tl-ev ${it.o.ctx}" style="${pos(it)}" data-a="openEvent" data-id="${esc(it.o.id)}"><span class="t">${mk(it.o.ctx)}<span class="ellip">${esc(it.o.title)}</span></span><span class="r">${hm(it.o.start)}–${hm(it.o.start + it.o.dur)}</span></button>`
     : `<button type="button" class="tl-task ${it.o.ctx} ${it.o.done ? 'done' : ''}" style="${pos(it)}" data-a="openTask" data-id="${it.o.id}"><span class="tasktag">TASK</span><span class="t small b ellip">${esc(it.o.title)}</span></button>`).join('');
   let hours = '';
   for (let m = START; m <= END; m += 60) hours += `<div class="tl-h" style="top:${(m - START) / 60 * H}px" data-a="newAt" data-v="${m}"><span>${hm(m)}</span><i></i></div>`;
   const nowLine = day === T ? `<div class="tl-now" style="top:${(nm - START) / 60 * H}px"><b>${hm(nm)}</b><i></i></div>` : '';
-  const dayEv = S.events.filter((e) => e.date === day).length;
+  const dayEv = ALL.filter((e) => e.date === day).length;
   const strip = days.map((d) => {
-    const evs = S.events.filter((e) => e.date === d);
+    const evs = ALL.filter((e) => e.date === d);
     const f = fromISO(d);
     return `<button type="button" class="day ${d === T ? 'today' : ''}" data-a="calDay" data-v="${d}" aria-pressed="${d === day}" aria-label="${dayLong(d)}">
       <span class="w">${WD[f.getDay()].toUpperCase()}</span><span class="n">${f.getDate()}</span>
@@ -180,6 +254,7 @@ VIEWS.calendar = () => {
       <div class="week" role="group" aria-label="Day">${strip}</div>
       <div class="rowx between"><span class="small b">${dayLong(day)} · ${dayEv === 1 ? '1 event' : dayEv + ' events'}</span>
       <span class="rowx g12 xs muted"><span class="rowx g6">${mk('work')}Work</span><span class="rowx g6">${mk('personal')}Personal</span></span></div></div>
+      ${dayAllDay.length ? `<div class="rowx g6" style="flex-wrap:wrap;padding:10px 20px 0">${dayAllDay.map((e) => `<button type="button" class="tag" data-a="openEvent" data-id="${esc(e.id)}">${mk(e.ctx)}All day · ${esc(e.title)}</button>`).join('')}</div>` : ''}
       <main class="main" style="padding-top:14px;padding-bottom:110px"><div class="tl" style="height:${(END - START) / 60 * H}px">${hours}${blocks}${nowLine}</div></main>
       <a class="fab" href="#/capture?type=event&date=${day}" aria-label="New event">${icon('plus', 26, 2.2)}</a>`,
   };
@@ -233,7 +308,7 @@ VIEWS.tasks = () => {
 /* inbox */
 function msgRows() {
   const q = ui.inboxQ.trim().toLowerCase();
-  const list = S.messages.filter((m) => (ui.inboxFilter === 'all' || m.type === ui.inboxFilter) && (!q || (m.who + ' ' + (m.subj || '') + ' ' + m.body).toLowerCase().includes(q)))
+  const list = allMessages().filter((m) => (ui.inboxFilter === 'all' || m.type === ui.inboxFilter) && (!q || (m.who + ' ' + (m.subj || '') + ' ' + m.body).toLowerCase().includes(q)))
     .sort((a, b) => (b.date + hm(b.time)).localeCompare(a.date + hm(a.time)));
   if (!list.length) return `<p class="empty" style="margin-top:12px">${q ? 'No matches.' : 'Nothing here.'}</p>`;
   const T = today(); let out = '', lastG = '';
@@ -242,7 +317,7 @@ function msgRows() {
     if (g !== lastG) { out += `<h2 class="h2" style="padding:14px 0 6px">${g}</h2>`; lastG = g; }
     const ic = { email: 'mail', text: 'text', call: 'phone' }[m.type];
     const bold = m.unread || m.missed;
-    out += `<a href="#/message/${m.id}" class="rowx g12" style="align-items:flex-start;padding:12px 0;border-bottom:1px solid var(--line2);text-decoration:none">
+    out += `<a href="#/message/${enc(m.id)}" class="rowx g12" style="align-items:flex-start;padding:12px 0;border-bottom:1px solid var(--line2);text-decoration:none">
       <span style="width:40px;height:40px;flex:none;border-radius:12px;background:var(--surface2);border:1px solid var(--line);display:flex;align-items:center;justify-content:center;color:var(--text2)">${icon(ic, 18)}</span>
       <span class="grow stack g4"><span class="rowx g8">${mk(m.ctx)}<span class="grow ellip" style="font-size:15px;font-weight:${bold ? 700 : 550};color:${bold ? 'var(--text)' : 'var(--text2)'}">${esc(m.who)}</span><span class="mono xs muted">${m.date === T ? hm(m.time) : relDay(m.date)}</span></span>
       ${m.subj ? `<span class="ellip" style="font-size:14px;font-weight:600;color:#E4E2DC">${esc(m.subj)}</span>` : ''}
@@ -251,24 +326,26 @@ function msgRows() {
   return out;
 }
 VIEWS.inbox = () => {
-  const c = (t) => S.messages.filter((m) => (t === 'all' || m.type === t) && (m.unread || m.missed)).length || '';
+  const c = (t) => allMessages().filter((m) => (t === 'all' || m.type === t) && (m.unread || m.missed)).length || '';
   const sample = S.messages.some((m) => m.sample);
   return {
     tab: 'inbox',
     html: `<div style="padding:calc(var(--st) + 14px) 20px 10px" class="stack g14">
       <header class="hd"><div class="stack g4"><span class="eyebrow">Email · Texts · Calls</span><h1 class="h1">Inbox</h1></div>
-      <a class="avatar" href="mailto:" aria-label="Compose email">${icon('edit', 20, 2)}</a></header>
+      <div class="rowx g8">${S.accounts.length ? `<button type="button" class="icon-btn" data-a="syncNow" aria-label="Refresh">${icon('refresh', 18, 2, isSyncing() ? 'style="opacity:.4"' : '')}</button>` : ''}<a class="avatar" href="mailto:" aria-label="Compose email">${icon('edit', 20, 2)}</a></div></header>
       <div class="search"><label for="iq" class="sr">Search messages</label>${icon('search', 18)}<input id="iq" class="input" type="search" placeholder="Search people, messages, calls" value="${esc(ui.inboxQ)}" data-i="inboxQ" autocomplete="off"></div>
       ${seg([{ id: 'all', label: 'All', count: c('all') }, { id: 'email', label: 'Email', count: c('email') }, { id: 'text', label: 'Texts', count: c('text') }, { id: 'call', label: 'Calls', count: c('call') }], ui.inboxFilter, 'inboxFilter', 4, 'aria-label="Show"')}</div>
       <main class="main" style="padding-top:0;gap:0">
-      ${sample ? '<p class="banner" style="margin-top:6px">These are sample messages so you can try things out. Gmail connects in the next step. iPhone doesn’t let any app read your texts or call history.</p>' : ''}
+      ${syncBanner()}
+      ${sample ? `<p class="banner" style="margin-top:6px">${S.accounts.length ? 'Sample messages are mixed in with your email. Remove them in More → Remove sample data.' : 'These are sample messages so you can try things out. Connect Gmail in More → Google accounts.'} iPhone doesn’t let any app read your texts or call history.</p>` : ''}
       <div id="inboxList">${msgRows()}</div></main>`,
   };
 };
 
 VIEWS.message = (r) => {
-  const m = byId(S.messages, r.id);
+  const m = findMsg(r.id);
   if (!m) return VIEWS.inbox();
+  if (m.g) return gMessageView(m);
   if (m.unread || m.missed) { m.unread = false; m.missed = false; save(); }
   const acts = messageActions(m);
   let body = esc(m.body);
@@ -286,6 +363,35 @@ VIEWS.message = (r) => {
     <div class="bottombar">${reply}<button type="button" class="btn primary wide" style="flex:1.3" data-a="makeTask" data-id="${m.id}">${icon('tasks', 18, 2)}Make task</button></div>`,
   };
 };
+function gMessageView(m) {
+  const a = acctById(m.g.acct), key = a.id + ':' + m.g.tid, th = G.bodies[key];
+  const raw = G.threads[a.id] && G.threads[a.id].find((t) => t.id === m.g.tid);
+  if (raw && raw.unread) { raw.unread = false; saveG(); call(a, 'markRead', { id: m.g.tid }, true).catch(() => {}); }
+  if (!th && !ui.loadingThread) {
+    ui.loadingThread = key;
+    call(a, 'thread', { id: m.g.tid }).then((d) => {
+      const msgs = d.thread.messages.map((x) => ({ from: x.from, date: x.date, body: cleanBody(x.body) }));
+      G.bodies[key] = { msgs, last: msgs.length ? msgs[msgs.length - 1].body : '' }; saveG();
+    }).catch((err) => toast('Couldn’t load the email: ' + err.message)).finally(() => { ui.loadingThread = null; if (location.hash === '#/message/' + enc(m.id) && !ui.sheet) render(); });
+  }
+  const acts = th ? detectActions(th.last) : [];
+  const mark = (txt) => { let b = esc(txt); acts.forEach((x) => { const s2 = esc(x.sentence); b = b.replace(s2, `<mark class="act">${s2}</mark>`); }); return b; };
+  const msgs = th ? th.msgs : [];
+  const earlier = msgs.slice(0, -1), last = msgs[msgs.length - 1];
+  return {
+    html: `<div class="topbar">${backLink('#/inbox', 'Inbox')}<div class="rowx g4"><a class="icon-btn plain" href="https://mail.google.com/mail/u/0/#all/${esc(m.g.tid)}" aria-label="Open in Gmail">${icon('mail', 20)}</a>
+      <button type="button" class="icon-btn plain" data-a="archiveMsg" data-id="${esc(m.id)}" aria-label="Archive">${icon('archive', 20)}</button></div></div>
+    <main class="main" style="padding-top:8px">
+      <div class="stack g10"><span class="rowx g8 xs b t2">${mk(m.ctx)}${LABEL[m.ctx]} · ${esc(a.email || 'Gmail')}${acts.length ? ` · ${acts.length} request${acts.length > 1 ? 's' : ''} found` : ''}</span>
+      <h1 style="font-size:24px;line-height:1.2;font-weight:700;font-stretch:110%">${esc(m.subj)}</h1></div>
+      ${earlier.length ? `<details class="card" style="padding:12px 14px;border-radius:14px"><summary class="small b" style="cursor:pointer">${earlier.length} earlier message${earlier.length > 1 ? 's' : ''}</summary>
+        <div class="stack g14" style="margin-top:12px">${earlier.map((x) => `<div class="stack g6"><span class="xs muted">${esc(parseFrom(x.from).name)} · ${relDay(iso(new Date(x.date)))}</span><div class="small" style="white-space:pre-wrap;line-height:1.5;color:var(--text2)">${esc(x.body.slice(0, 1500))}</div></div>`).join('')}</div></details>` : ''}
+      <div class="rowx g12"><span class="avatar" style="width:40px;height:40px;background:var(--raise);color:var(--text);font-size:14px">${esc((m.who || '?').split(/\s+/).map((w) => w[0]).join('').slice(0, 2).toUpperCase())}</span>
+      <span class="grow stack g4" style="min-width:0"><span class="b ellip">${esc(m.who)}</span><span class="small muted ellip">${esc(m.from)} · ${relDay(m.date)} ${hm(m.time)}</span></span></div>
+      ${last ? `<div class="msgbody">${mark(last.body).split(/\n{2,}/).map((p) => `<p>${p}</p>`).join('')}</div>` : `<p class="small muted">Loading the full email…</p><div class="msgbody"><p>${esc(m.body)}</p></div>`}</main>
+    <div class="bottombar"><button type="button" class="btn wide" data-a="replyMsg" data-id="${esc(m.id)}">${icon('reply', 18)}Reply</button><button type="button" class="btn primary wide" style="flex:1.3" data-a="makeTask" data-id="${esc(m.id)}">${icon('tasks', 18, 2)}Make task</button></div>`,
+  };
+}
 function messageActions(m) {
   if (m.actions) {
     return m.actions.map((a) => {
@@ -293,6 +399,7 @@ function messageActions(m) {
       return { title: a.title, date: resolveDay(a.day), sentence };
     });
   }
+  if (m.g) { const th = G.bodies[m.g.acct + ':' + m.g.tid]; return detectActions(th ? th.last : m.body); }
   return detectActions(m.body);
 }
 
@@ -316,12 +423,16 @@ VIEWS.more = () => {
         ${tile('', 'person', 'Contacts', 'Work and personal', true)}
         ${tile('', 'folder', 'Files', 'Attachments', true)}
       </section>
+      <section class="stack g10" aria-label="Google accounts"><h2 class="h2">Google accounts</h2>
+        ${S.accounts.map((a) => { const st = G.sync[a.id] || {}; return `<button type="button" class="card rowx g12" style="padding:14px 16px;border-radius:16px;text-align:left" data-a="openAcct" data-id="${a.id}">${mk(a.ctx)}<span class="grow stack g4" style="min-width:0"><span class="b ellip">${esc(a.email || 'Google account')}</span><span class="small ${st.error ? '' : 'muted'}" style="${st.error ? 'color:var(--alert)' : ''}">${st.error ? 'Problem: ' + esc(st.error) : 'Gmail + Calendar · synced ' + ago(st.at)}</span></span>${icon('right', 18, 2)}</button>`; }).join('')}
+        <div class="${S.accounts.length ? 'grid2' : 'stack'}"><button type="button" class="btn" data-a="gConnect">${icon('plus', 18, 2)}${S.accounts.length ? 'Add account' : 'Connect Gmail and Calendar'}</button>${S.accounts.length ? `<button type="button" class="btn" data-a="syncNow">${icon('refresh', 18, 2)}Sync now</button>` : ''}</div>
+      </section>
       <section class="stack" aria-label="Work and personal"><h2 class="h2" style="margin-bottom:4px">Work / personal split</h2>
         <div class="swrow"><div class="grow stack g4"><span id="sw-auto" class="b">Auto-switch by work hours</span><span class="small muted" style="line-height:1.35">Mon–Fri 08:00–18:00 opens on Work; evenings and weekends open on Personal</span></div>
         <button type="button" class="switch" role="switch" aria-checked="${!!S.settings.autoSwitch}" aria-labelledby="sw-auto" data-a="toggleAuto"><span class="trk"><span class="kn"></span></span></button></div>
       </section>
       <section class="stack" aria-label="Coming next"><h2 class="h2" style="margin-bottom:4px">Coming next</h2>
-        ${next.map(([a, b]) => `<div class="swrow"><span class="grow stack g4"><span class="b">${a}</span><span class="small muted">${b}</span></span><span class="pill">NEXT</span></div>`).join('')}
+        ${next.filter(([a]) => !(S.accounts.length && a.startsWith('Gmail'))).map(([a, b]) => `<div class="swrow"><span class="grow stack g4"><span class="b">${a}</span><span class="small muted">${b}</span></span><span class="pill">NEXT</span></div>`).join('')}
       </section>
       <section class="stack g10" aria-label="Your data"><h2 class="h2">Your data</h2>
         <p class="small muted" style="line-height:1.45">Everything is saved on this phone only. Export a backup now and then so nothing is lost if you delete the app.</p>
@@ -379,6 +490,8 @@ function capDyn() {
   if (d.type === 'task') rows.push(['Due', d.date ? relDay(d.date) + (d.time != null ? ' · ' + hm(d.time) : '') : 'No date · goes to Someday']);
   if (d.type === 'waiting') { rows.push(['From', d.who || '—']); rows.push(['Expected', d.date ? relDay(d.date) : 'No date']); }
   if (d.type !== 'note') rows.push(['Project', d.project || 'None']);
+  const tgt = d.type === 'event' ? gTarget(d.ctx) : null;
+  const saveTo = tgt ? `<div class="field"><span class="lbl">Save to</span><div class="rowx g6" style="flex-wrap:wrap"><button type="button" class="chip soft" data-a="capLocal" data-v="0" aria-pressed="${!c.local}">${icon('cal', 16, 2)}${esc(tgt.name)}</button><button type="button" class="chip soft" data-a="capLocal" data-v="1" aria-pressed="${!!c.local}">Pit Wall only</button></div></div>` : '';
   const typeSeg = seg([{ id: 'task', label: 'Task' }, { id: 'event', label: 'Event' }, { id: 'note', label: 'Note' }, { id: 'waiting', label: 'Waiting' }], d.type, 'capType', 4, 'aria-label="Save as"');
   const extras = d.type === 'event'
     ? `<div class="field"><span class="lbl">Length</span><div class="rowx g6">${[30, 60, 90, 120].map((m) => `<button type="button" class="chip" data-a="capDur" data-v="${m}" aria-pressed="${d.dur === m}">${durShort(m).toLowerCase()}</button>`).join('')}</div></div>
@@ -391,6 +504,7 @@ function capDyn() {
       <div class="stack g6"><div class="rowx g6">${['work', 'personal'].map((x) => `<button type="button" class="chip soft" data-a="capCtx" data-v="${x}" aria-pressed="${d.ctx === x}">${mk(x)}${LABEL[x]}</button>`).join('')}</div><span class="xs muted">${d.ctxHint}</span></div></div>
     </section>
     ${extras}
+    ${saveTo}
     <section class="stack g10" aria-label="Examples"><h2 class="h2">Try</h2><div class="rowx g8" style="flex-wrap:wrap">${EXAMPLES.map((e, i) => `<button type="button" class="chip ex" data-a="capEx" data-v="${i}">${esc(e)}</button>`).join('')}</div></section>`;
 }
 const SAVE_LBL = { task: 'Add task', event: 'Add event', note: 'Save note', waiting: 'Track reply' };
@@ -440,6 +554,17 @@ VIEWS.waiting = () => {
   const groups = [['overdue', 'Overdue', 'color:var(--alert)'], ['soon', 'Expected soon', ''], ['nodate', 'No date', '']]
     .map(([g, label, st]) => { const items = shown.filter((w) => grp(w) === g).sort((a, b) => (a.expect || '').localeCompare(b.expect || '')); return items.length ? `<section class="stack g10"><h2 class="h2" style="${st}">${label}</h2>${items.map(card).join('')}</section>` : ''; }).join('');
   const overdue = live.filter((w) => grp(w) === 'overdue').length;
+  const dismissed = S.meta.dismissed || {};
+  const sugg = [];
+  for (const a of S.accounts) for (const it of (G.waiting[a.id] || [])) {
+    if (dismissed[it.id] || S.waiting.some((w) => w.src && w.src.thread === it.id)) continue;
+    sugg.push({ a, it });
+  }
+  const suggHTML = sugg.length ? `<section class="stack g10"><h2 class="h2">From your sent mail · ${sugg.length}</h2>
+    ${sugg.slice(0, 8).map(({ a, it }) => `<article class="card" style="padding:14px;border-radius:18px;display:flex;flex-direction:column;gap:10px;border-style:dashed">
+      <span class="rowx g8">${mk(a.ctx)}<span class="b ellip grow">${esc(parseFrom(it.to.split(',')[0]).name || it.to)}</span><span class="pill">SENT ${relDay(iso(new Date(it.sent))).toUpperCase()}</span></span>
+      <span style="font-size:15px;font-weight:600;line-height:1.3">${esc(it.subj)}</span>
+      <div class="rowx g8"><button type="button" class="btn sm wide" data-a="dismissSent" data-id="${esc(it.id)}">Not needed</button><button type="button" class="btn sm primary wide" data-a="trackSent" data-id="${esc(a.id + '|' + it.id)}">Track reply</button></div></article>`).join('')}</section>` : '';
   return {
     tab: 'tasks',
     html: `<div class="topbar">${backLink('#/tasks', 'Tasks')}<a class="icon-btn" href="#/capture?type=waiting" aria-label="Track a reply">${icon('plus', 20, 2)}</a></div>
@@ -447,7 +572,8 @@ VIEWS.waiting = () => {
       <header class="stack g6"><span class="eyebrow">${live.length} open · ${overdue} overdue</span><h1 class="h1 sm">Waiting on</h1>
       <p class="small muted" style="line-height:1.4">Replies you’re owed. Nudge opens a ready-to-send follow-up.</p></header>
       ${ctxSeg(ui.waitCtx, 'waitCtx')}
-      ${groups || '<p class="empty">Nobody owes you anything. Enjoy it.</p>'}
+      ${suggHTML}
+      ${groups || (suggHTML ? '' : '<p class="empty">Nobody owes you anything. Enjoy it.</p>')}
     </main>`,
   };
 };
@@ -516,7 +642,7 @@ function planCtx() {
   const day = today(), nm = nowMin();
   const START = Math.max(6 * 60, Math.floor((nm - 30) / 60) * 60);
   const FIRST = Math.ceil((nm + 5) / 30) * 30;
-  const busy = (skipId) => S.events.filter((e) => e.date === day).map((e) => [e.start, e.start + e.dur])
+  const busy = (skipId) => timed(allEvents()).filter((e) => e.date === day).map((e) => [e.start, e.start + e.dur])
     .concat(S.tasks.filter((t) => t.sched && t.sched.date === day && t.id !== skipId && !t.done).map((t) => [t.sched.start, t.sched.start + (t.est || 30)]));
   const fits = (st, d, skip) => st + d <= PLAN.END && busy(skip).every((b) => st + d <= b[0] || st >= b[1]);
   return { day, nm, START, FIRST, fits };
@@ -537,7 +663,7 @@ VIEWS.plan = () => {
   let free = 0; for (let st = P.FIRST; st < PLAN.FREE_END; st += 30) if (P.fits(st, 30, null)) free += 30;
   const H = PLAN.H, top = (m) => (m - P.START) / 60 * H;
   let hours = ''; for (let m = P.START; m <= PLAN.END; m += 60) hours += `<div class="tl-h" style="top:${top(m)}px"><span>${hm(m)}</span><i></i></div>`;
-  const evs = S.events.filter((e) => e.date === T && e.start + e.dur > P.START).map((e) => `<button type="button" class="tl-ev ${e.ctx}" style="left:56px;right:0;top:${top(Math.max(e.start, P.START)) + 2}px;height:${Math.max((e.start + e.dur - Math.max(e.start, P.START)) / 60 * H - 4, 22)}px" data-a="openEvent" data-id="${e.id}"><span class="t">${mk(e.ctx)}<span class="ellip">${esc(e.title)}</span></span><span class="r">${hm(e.start)}–${hm(e.start + e.dur)}</span></button>`).join('');
+  const evs = timed(allEvents()).filter((e) => e.date === T && e.start + e.dur > P.START).map((e) => `<button type="button" class="tl-ev ${e.ctx}" style="left:56px;right:0;top:${top(Math.max(e.start, P.START)) + 2}px;height:${Math.max((e.start + e.dur - Math.max(e.start, P.START)) / 60 * H - 4, 22)}px" data-a="openEvent" data-id="${esc(e.id)}"><span class="t">${mk(e.ctx)}<span class="ellip">${esc(e.title)}</span></span><span class="r">${hm(e.start)}–${hm(e.start + e.dur)}</span></button>`).join('');
   const placed = S.tasks.filter((t) => t.sched && t.sched.date === T && t.sched.start + (t.est || 30) > P.START).map((t) => `<div class="tl-task ${t.ctx} ${t.done ? 'done' : ''}" style="left:56px;right:0;top:${top(t.sched.start) + 2}px;height:${Math.max((t.est || 30) / 60 * H - 4, 26)}px">
     <button type="button" class="grow stack g4" style="text-align:left;min-width:0" data-a="openTask" data-id="${t.id}"><span class="rowx g8"><span class="tasktag">TASK</span><span class="t small b ellip">${esc(t.title)}</span></span>${(t.est || 30) >= 45 ? `<span class="mono" style="font-size:11px;color:var(--text2)">${hm(t.sched.start)}–${hm(t.sched.start + (t.est || 30))}</span>` : ''}</button>
     <button type="button" class="icon-btn plain" style="width:40px;height:40px;color:var(--muted)" data-a="unsched" data-id="${t.id}" aria-label="Unschedule ${esc(t.title)}">${icon('x', 16, 2.2)}</button></div>`).join('');
@@ -634,7 +760,7 @@ function planAfter() {
 /* leave by */
 const MODES = { drive: ['Drive', 'd', 'driving'], transit: ['Transit', 'r', 'transit'], bike: ['Bike', null, 'bicycling'], walk: ['Walk', 'w', 'walking'] };
 VIEWS.trip = (r) => {
-  const e = byId(S.events, r.id);
+  const e = findEvent(r.id);
   if (!e) return VIEWS.today();
   if (!e.travel) e.travel = { mode: 'drive', mins: {} };
   const mode = e.travel.mode, mins = e.travel.mins[mode];
@@ -646,7 +772,7 @@ VIEWS.trip = (r) => {
   const google = `https://www.google.com/maps/dir/?api=1&destination=${dest}&travelmode=${MODES[mode][2]}`;
   return {
     tab: 'today',
-    html: `<div class="topbar">${backLink('#/today', 'Today')}<button type="button" class="btn sm" data-a="openEvent" data-id="${e.id}">Edit event</button></div>
+    html: `<div class="topbar">${backLink('#/today', 'Today')}<button type="button" class="btn sm" data-a="openEvent" data-id="${esc(e.id)}">Edit event</button></div>
     <main class="main" style="padding-top:4px;gap:20px">
       <header class="stack g6"><span class="eyebrow" style="color:var(--pers)">Leave by${until != null ? (until >= 0 ? ' · in ' + dur(until) : ' · ' + dur(-until) + ' ago') : e.date !== T ? ' · ' + relDay(e.date) : ''}</span>
       <span class="mono" style="font-size:72px;line-height:.95;font-weight:500;letter-spacing:-.03em">${lv != null ? hm(lv) : '--:--'}</span>
@@ -673,6 +799,9 @@ function renderSheet() {
   else if (sh.type === 'mk') inner = mkSheet(sh);
   else if (sh.type === 'waiting') inner = waitingSheet(sh);
   else if (sh.type === 'wk') inner = wkSheet();
+  else if (sh.type === 'gconnect') inner = gConnectSheet(sh);
+  else if (sh.type === 'gacct') inner = gAcctSheet(sh);
+  else if (sh.type === 'reply') inner = replySheet(sh);
   return `<div class="backdrop" data-a="closeSheet"></div><section class="sheet" role="dialog" aria-modal="true"><span class="grab"></span>${inner}</section>`;
 }
 const sheetHead = (title, sub) => `<div class="rowx between" style="align-items:flex-start;gap:12px"><div class="stack g4"><h2 style="font-size:22px;font-weight:750;font-stretch:115%">${esc(title)}</h2>${sub ? `<span class="small muted">${sub}</span>` : ''}</div>
@@ -682,7 +811,7 @@ const EST = [15, 30, 45, 60, 90, 120, 180, 240];
 
 function taskSheet(sh) {
   const t = byId(S.tasks, sh.id); if (!t) return '';
-  const src = t.src && byId(S.messages, t.src.msg);
+  const src = t.src && findMsg(t.src.msg);
   return `${sheetHead(sh.isNew ? 'New task' : 'Task')}
   <form class="stack g14" data-f="saveTask" data-id="${t.id}">
     <div class="field"><label class="lbl" for="tt">Title</label><input id="tt" name="title" class="input" value="${esc(t.title)}" autocomplete="off"></div>
@@ -691,26 +820,26 @@ function taskSheet(sh) {
     <div class="field"><label class="lbl" for="test">Takes about</label><select id="test" name="est" class="input">${EST.map((m) => `<option value="${m}" ${(t.est || 30) === m ? 'selected' : ''}>${dur(m)}</option>`).join('')}</select></div></div>
     <div class="field"><label class="lbl" for="tproj">Project</label><input id="tproj" name="project" class="input" list="projlist" value="${esc(t.project || '')}" placeholder="None" autocomplete="off"><datalist id="projlist">${projectNames().map((p) => `<option value="${esc(p)}">`).join('')}</datalist></div>
     ${t.sched ? `<div class="rowx between card" style="padding:10px 14px;border-radius:14px"><span class="small">Scheduled ${relDay(t.sched.date).toLowerCase()} at ${hm(t.sched.start)}</span><button type="button" class="btn sm" data-a="unsched" data-id="${t.id}">Unschedule</button></div>` : ''}
-    ${src ? `<a class="btn" href="#/message/${src.id}">${icon('mail', 18)}Open the email</a>` : ''}
+    ${src ? `<a class="btn" href="#/message/${enc(src.id)}">${icon('mail', 18)}Open the email</a>` : ''}
     <div class="rowx g8"><button type="button" class="btn danger" data-a="deleteTask" data-id="${t.id}" aria-label="Delete task">${icon('trash', 18)}</button><button class="btn primary wide">Save</button></div>
   </form>`;
 }
 function eventSheet(sh) {
-  const e = byId(S.events, sh.id); if (!e) return '';
+  const e = findEvent(sh.id); if (!e) return '';
   const lv = leaveAt(e);
-  return `${sheetHead(e.title, `${relDay(e.date)} · ${hm(e.start)}–${hm(e.start + e.dur)}`)}
-    <div class="stack g8">${e.location ? `<span class="rowx g8 t2">${icon('pin', 18)}${esc(e.location)}</span>` : ''}<span class="rowx g8 small t2">${mk(e.ctx)}${LABEL[e.ctx]} · ${dur(e.dur)}</span></div>
-    ${e.location && !isVideo(e.location) ? `<a class="btn primary" href="#/trip/${e.id}">${icon('car', 18)}${lv != null ? 'Leave by ' + hm(lv) : 'Set up Leave by'}</a>` : ''}
-    <div class="rowx g8"><button type="button" class="btn danger" data-a="deleteEvent" data-id="${e.id}" aria-label="Delete event">${icon('trash', 18)}</button><button type="button" class="btn wide" data-a="editEvent" data-id="${e.id}">${icon('edit', 18)}Edit</button></div>`;
+  return `${sheetHead(e.title, e.allDay ? `${relDay(e.date)} · All day` : `${relDay(e.date)} · ${hm(e.start)}–${hm(e.start + e.dur)}`)}
+    <div class="stack g8">${e.location ? `<span class="rowx g8 t2">${icon('pin', 18)}${esc(e.location)}</span>` : ''}<span class="rowx g8 small t2">${mk(e.ctx)}${LABEL[e.ctx]}${e.allDay ? '' : ' · ' + dur(e.dur)}${e.g ? ' · ' + esc(e.g.calName) + ' (Google)' : ''}</span></div>
+    ${e.location && !isVideo(e.location) && !e.allDay ? `<a class="btn primary" href="#/trip/${enc(e.id)}">${icon('car', 18)}${lv != null ? 'Leave by ' + hm(lv) : 'Set up Leave by'}</a>` : ''}
+    ${e.allDay && e.g ? '<p class="small muted">All-day events are edited in Google Calendar.</p>' : `<div class="rowx g8"><button type="button" class="btn danger" data-a="deleteEvent" data-id="${esc(e.id)}" aria-label="Delete event">${icon('trash', 18)}</button><button type="button" class="btn wide" data-a="editEvent" data-id="${esc(e.id)}">${icon('edit', 18)}Edit</button></div>`}`;
 }
 function eventEditSheet(sh) {
-  const e = byId(S.events, sh.id); if (!e) return '';
+  const e = findEvent(sh.id); if (!e) return '';
   const durs = [15, 30, 45, 60, 90, 120, 180, 240, 300, 480];
   if (!durs.includes(e.dur)) durs.push(e.dur);
   return `${sheetHead(sh.isNew ? 'New event' : 'Edit event')}
-  <form class="stack g14" data-f="saveEvent" data-id="${e.id}">
+  <form class="stack g14" data-f="saveEvent" data-id="${esc(e.id)}">
     <div class="field"><label class="lbl" for="et">Title</label><input id="et" name="title" class="input" value="${esc(e.title)}" autocomplete="off"></div>
-    ${ctxPicker(e.ctx)}
+    ${e.g ? `<p class="small muted">${mk(e.ctx)} Saved in ${esc(e.g.calName)} (Google). Changes go straight to Google Calendar.</p>` : ctxPicker(e.ctx)}
     <div class="grid2"><div class="field"><label class="lbl" for="ed">Date</label><input id="ed" name="date" type="date" class="input" value="${e.date}" required></div>
     <div class="field"><label class="lbl" for="es">Starts</label><input id="es" name="start" type="time" class="input" value="${hm(e.start)}" required></div></div>
     <div class="field"><label class="lbl" for="edur">Length</label><select id="edur" name="dur" class="input">${durs.sort((a, b) => a - b).map((m) => `<option value="${m}" ${e.dur === m ? 'selected' : ''}>${dur(m)}</option>`).join('')}</select></div>
@@ -719,7 +848,7 @@ function eventEditSheet(sh) {
   </form>`;
 }
 function mkSheet(sh) {
-  const m = byId(S.messages, sh.id); if (!m) return '';
+  const m = findMsg(sh.id); if (!m) return '';
   if (sh.done) {
     return `<div role="status" class="stack g16"><div class="rowx g12"><span style="width:40px;height:40px;border-radius:20px;background:var(--ok);color:var(--bg);display:flex;align-items:center;justify-content:center;flex:none">${icon('check', 20, 3)}</span>
       <span class="stack g4"><span class="b" style="font-size:18px">${sh.done === 1 ? 'Task created' : sh.done + ' tasks created'}</span><span class="small muted">Linked to this ${m.type === 'email' ? 'email' : 'message'}</span></span></div>
@@ -764,6 +893,44 @@ function wkSheet() {
   </form>`;
 }
 
+function gConnectSheet(sh) {
+  return `${sheetHead('Connect Google', 'Gmail and Calendar, through your own private connector')}
+  <form class="stack g14" data-f="gConnect">
+    <p class="small muted" style="line-height:1.45">First set up the Pit Wall connector in your Google account (see google/PitWallConnector.gs in the Pit-Wall repo). Then paste its link here.</p>
+    <div class="field"><label class="lbl" for="gl">Connection link</label><textarea id="gl" name="link" class="input" style="min-height:96px;font-size:15px;font-weight:400" placeholder="https://script.google.com/macros/s/…/exec?key=…" autocapitalize="off" autocorrect="off" spellcheck="false"></textarea></div>
+    <div class="field"><label class="lbl" for="gk">Key (only if it isn’t in the link)</label><input id="gk" name="key" class="input" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"></div>
+    ${ctxPicker('personal').replace('>Category<', '>This account is mostly<')}
+    ${sh.error ? `<p class="small" style="color:var(--alert);line-height:1.4" role="alert">${esc(sh.error)}</p>` : ''}
+    <button class="btn primary" style="height:54px" ${sh.busy ? 'disabled' : ''}>${sh.busy ? 'Connecting…' : 'Connect'}</button>
+  </form>`;
+}
+function gAcctSheet(sh) {
+  const a = acctById(sh.id); if (!a) return '';
+  const ids = Object.keys(a.cals);
+  const opts = (sel) => `<option value="">Pit Wall only</option>` + ids.map((id) => `<option value="${esc(id)}" ${sel === id ? 'selected' : ''}>${esc(a.cals[id].name)}</option>`).join('');
+  const st = G.sync[a.id] || {};
+  return `${sheetHead(a.email || 'Google account', sh.fresh ? 'Connected. Pick which calendars to show.' : (st.error ? 'Problem: ' + esc(st.error) : 'Synced ' + ago(st.at)))}
+  <form class="stack g14" data-f="saveAcct" data-id="${a.id}">
+    ${ctxPicker(a.ctx).replace('>Category<', '>Email from this account counts as<')}
+    <label class="swrow" style="cursor:pointer"><span class="grow stack g4"><span class="b">Show Gmail inbox</span><span class="small muted">Latest 30 conversations</span></span><input type="checkbox" name="mail" ${a.mail !== false ? 'checked' : ''} style="width:24px;height:24px;accent-color:#F2F0EB"></label>
+    <div class="field"><span class="lbl">Calendars</span>
+      ${ids.map((id, i) => `<div class="rowx g10" style="padding:8px 0;border-bottom:1px solid var(--line2)">
+        <label class="rowx g10 grow" style="min-width:0;min-height:40px;cursor:pointer"><input type="checkbox" name="show${i}" ${a.cals[id].show !== false ? 'checked' : ''} style="width:22px;height:22px;flex:none;accent-color:#F2F0EB"><span class="ellip">${esc(a.cals[id].name)}</span></label>
+        <select name="cctx${i}" class="input" style="width:118px;height:40px;flex:none;font-size:14px" aria-label="${esc(a.cals[id].name)} category"><option value="work" ${a.cals[id].ctx === 'work' ? 'selected' : ''}>Work</option><option value="personal" ${a.cals[id].ctx !== 'work' ? 'selected' : ''}>Personal</option></select></div>`).join('')}
+    </div>
+    <div class="grid2"><div class="field"><label class="lbl" for="wcw">New work events</label><select id="wcw" name="wcw" class="input" style="font-size:14px">${opts(a.writeCal && a.writeCal.work)}</select></div>
+    <div class="field"><label class="lbl" for="wcp">New personal events</label><select id="wcp" name="wcp" class="input" style="font-size:14px">${opts(a.writeCal && a.writeCal.personal)}</select></div></div>
+    ${sh.fresh && hasSamples() ? `<button type="button" class="btn" data-a="removeSamplesNow">Remove the sample data</button>` : ''}
+    <div class="rowx g8"><button type="button" class="btn danger" data-a="disconnect" data-id="${a.id}">Disconnect</button><button class="btn primary wide">Save</button></div>
+  </form>`;
+}
+function replySheet(sh) {
+  const m = findMsg(sh.id); if (!m) return '';
+  return `${sheetHead('Reply', 'To ' + esc(m.who) + ' · sends from ' + esc((acctById(m.g.acct) || {}).email || 'Gmail'))}
+  <form class="stack g12" data-f="sendReply" data-id="${esc(m.id)}"><label class="sr" for="rb">Message</label><textarea id="rb" name="body" class="input" style="min-height:160px;font-size:16px;font-weight:400" placeholder="Write your reply…"></textarea>
+  <div class="rowx g8"><button type="button" class="btn" data-a="closeSheet">Cancel</button><button class="btn primary wide">Send</button></div></form>`;
+}
+
 /* ---------- toast ---------- */
 let toastTimer;
 function toast(msg, undo) {
@@ -793,7 +960,18 @@ const A = {
   closeSheet: () => { const sh = ui.sheet; ui.sheet = null; if (sh && sh.isNew && sh.type === 'event') { /* nothing saved */ } render(); },
   pick: (el) => { const g = el.closest('[data-group]'); g.querySelectorAll('[data-a="pick"]').forEach((b) => b.setAttribute('aria-pressed', b === el)); const form = el.closest('form'); const inp = form && form.querySelector(`input[name="${g.dataset.group}"]`); if (inp) inp.value = el.dataset.v; },
   deleteTask: (el) => { const i = S.tasks.findIndex((t) => t.id === el.dataset.id); const [t] = S.tasks.splice(i, 1); ui.sheet = null; save(); render(); toast('Task deleted', () => { S.tasks.splice(i, 0, t); save(); render(); }); },
-  deleteEvent: (el) => { const i = S.events.findIndex((e) => e.id === el.dataset.id); const [e] = S.events.splice(i, 1); ui.sheet = null; save(); if (location.hash.startsWith('#/trip/')) go('#/today'); else render(); toast('Event deleted', () => { S.events.splice(i, 0, e); save(); render(); }); },
+  deleteEvent: (el) => {
+    const ev = findEvent(el.dataset.id); if (!ev) return;
+    if (ev.g) {
+      if (!confirm('Delete “' + ev.title + '” from Google Calendar?')) return;
+      const a = acctById(ev.g.acct); const list = G.events[a.id] || []; const idx = list.findIndex((x) => x.eid === ev.g.eid && x.start === ev.g.origStart);
+      const removed = idx >= 0 ? list.splice(idx, 1)[0] : null; saveG();
+      ui.sheet = null; if (location.hash.startsWith('#/trip/')) go('#/today'); else render();
+      call(a, 'deleteEvent', { cal: ev.g.cal, eid: ev.g.eid, origStart: ev.g.origStart }, true).then(() => toast('Deleted from Google Calendar')).catch((err) => { if (removed) list.splice(idx, 0, removed); saveG(); render(); toast('Couldn’t delete: ' + err.message); });
+      return;
+    }
+    const i = S.events.findIndex((e) => e.id === el.dataset.id); const [e] = S.events.splice(i, 1); ui.sheet = null; save(); if (location.hash.startsWith('#/trip/')) go('#/today'); else render(); toast('Event deleted', () => { S.events.splice(i, 0, e); save(); render(); });
+  },
   deleteWaiting: (el) => { const i = S.waiting.findIndex((e) => e.id === el.dataset.id); const [w] = S.waiting.splice(i, 1); ui.sheet = null; save(); render(); toast('Removed', () => { S.waiting.splice(i, 0, w); save(); render(); }); },
   deleteMsg: (el) => { const i = S.messages.findIndex((m) => m.id === el.dataset.id); const [m] = S.messages.splice(i, 1); save(); go('#/inbox'); toast('Message removed', () => { S.messages.splice(i, 0, m); save(); render(); }); },
   deleteNote: (el) => { const i = S.notes.findIndex((n) => n.id === el.dataset.id); const [n] = S.notes.splice(i, 1); save(); render(); toast('Note deleted', () => { S.notes.splice(i, 0, n); save(); render(); }); },
@@ -802,15 +980,36 @@ const A = {
   gotReply: (el) => { const w = byId(S.waiting, el.dataset.id); w.done = true; save(); render(); toast('Cleared', () => { w.done = false; save(); render(); }); },
   nudge: (el) => { const w = byId(S.waiting, el.dataset.id); w.nudged = today(); save(); setTimeout(render, 400); },
   makeTask: (el) => {
-    const m = byId(S.messages, el.dataset.id);
+    const m = findMsg(el.dataset.id);
     let acts = messageActions(m);
     if (!acts.length) acts = [{ title: m.subj ? 'Reply: ' + m.subj : (m.type === 'call' ? 'Call back ' : 'Reply to ') + m.who, date: today() }];
     ui.sheet = { type: 'mk', id: m.id, items: acts.map((a) => ({ title: a.title, date: a.date, on: true })) };
     render();
   },
+  syncNow: () => { toast('Syncing…'); syncAll().then(() => { render(); const e = syncErrors(); toast(e.length ? 'Sync problem: ' + e[0].error : 'Up to date'); }); render(); },
+  gConnect: () => { ui.sheet = { type: 'gconnect' }; render(); },
+  openAcct: (el) => { ui.sheet = { type: 'gacct', id: el.dataset.id }; render(); },
+  disconnect: (el) => {
+    const a = acctById(el.dataset.id); if (!a || !confirm('Disconnect ' + (a.email || 'this account') + '? Its email and events disappear from Pit Wall (nothing is deleted in Google).')) return;
+    S.accounts = S.accounts.filter((x) => x.id !== a.id); forgetAccount(a.id); save(); ui.sheet = null; render(); toast('Disconnected');
+  },
+  archiveMsg: (el) => {
+    const m = findMsg(el.dataset.id); if (!m || !m.g) return;
+    const a = acctById(m.g.acct); const list = G.threads[a.id] || []; const i = list.findIndex((t) => t.id === m.g.tid); const [t] = i >= 0 ? list.splice(i, 1) : [null]; saveG();
+    go('#/inbox');
+    call(a, 'archive', { id: m.g.tid }, true).then(() => toast('Archived')).catch((err) => { if (t) list.splice(i, 0, t); saveG(); render(); toast('Couldn’t archive: ' + err.message); });
+  },
+  replyMsg: (el) => { ui.sheet = { type: 'reply', id: el.dataset.id }; render(); setTimeout(() => { const t = app.querySelector('#rb'); if (t) t.focus(); }, 80); },
+  trackSent: (el) => {
+    const [aid, tid] = el.dataset.id.split('|'); const a = acctById(aid); const it = (G.waiting[aid] || []).find((x) => x.id === tid); if (!it) return;
+    S.waiting.push({ id: uid(), who: parseFrom(it.to.split(',')[0]).name || it.to, what: it.subj, via: 'email', ctx: a.ctx, sent: iso(new Date(it.sent)), expect: null, nudged: null, done: false, auto: true, src: { thread: tid } });
+    save(); render(); toast('Tracking reply');
+  },
+  dismissSent: (el) => { S.meta.dismissed = S.meta.dismissed || {}; S.meta.dismissed[el.dataset.id] = 1; save(); render(); },
+  removeSamplesNow: () => { removeSamples(); ui.taskProject = null; ui.sheet = null; render(); toast('Sample data removed'); },
   toggleAuto: () => { S.settings.autoSwitch = !S.settings.autoSwitch; save(); render(); },
   clearSamples: () => { if (confirm('Remove all the sample tasks, events, messages and notes? Anything you added stays.')) { removeSamples(); ui.taskProject = null; render(); toast('Sample data removed'); } },
-  resetApp: () => { if (confirm('Erase everything on this phone and start again with the sample data?')) { reset(); render(); toast('App reset'); } },
+  resetApp: () => { if (confirm('Erase everything on this phone and start again with the sample data? Your Google connections stay.')) { reset(); render(); toast('App reset'); } },
   exportData: async () => {
     const name = `pitwall-backup-${today()}.json`;
     const blob = new Blob([JSON.stringify(S, null, 2)], { type: 'application/json' });
@@ -824,6 +1023,7 @@ const A = {
   capType: (el) => { ui.cap.type = el.dataset.v; refreshCap(true); },
   capCtx: (el) => { ui.cap.ctx = el.dataset.v; refreshCap(); },
   capDur: (el) => { ui.cap.dur = +el.dataset.v; refreshCap(); },
+  capLocal: (el) => { ui.cap.local = el.dataset.v === '1'; refreshCap(); },
   capEx: (el) => { Object.assign(ui.cap, { text: EXAMPLES[+el.dataset.v], type: null, ctx: null, dur: null, location: null, who: null }); const ta = app.querySelector('#cap'); ta.value = ui.cap.text; refreshCap(true); },
   capMic: () => { const ta = app.querySelector('#cap'); ta.focus(); toast('Tap the mic on your keyboard to dictate'); },
   capCancel: () => { ui.cap = null; if (history.length > 1) history.back(); else go('#/today'); },
@@ -833,7 +1033,22 @@ const A = {
     if (!d.title && d.type !== 'note') { toast('Type something first'); return; }
     let msg;
     if (d.type === 'task') { S.tasks.push(newTask({ title: d.title, ctx: d.ctx, project: d.project, due: d.date, dueTime: d.time })); msg = 'Added to ' + (d.date ? relDay(d.date) : 'Someday'); }
-    else if (d.type === 'event') { S.events.push(newEvent({ title: d.title, ctx: d.ctx, date: d.date, start: d.time, dur: d.dur, location: d.location })); msg = `Added to ${relDay(d.date)} at ${hm(d.time)}`; }
+    else if (d.type === 'event') {
+      const tgt = gTarget(d.ctx);
+      if (tgt && !c.local) {
+        const st = fromISO(d.date); st.setMinutes(d.time); const en = new Date(st.getTime() + d.dur * 60000);
+        const btn = app.querySelector('#capSave'); if (btn) { btn.disabled = true; btn.textContent = 'Saving to Google…'; }
+        call(tgt.acct, 'createEvent', { cal: tgt.cal, title: d.title, location: d.location, start: st.toISOString(), end: en.toISOString() }, true).then((r) => {
+          (G.events[tgt.acct.id] = G.events[tgt.acct.id] || []).push(r.event); saveG();
+          if (ui.cap === c) { c.saved = `Added to ${tgt.name} · ${relDay(d.date)} at ${hm(d.time)}`; render(); }
+        }).catch((err) => {
+          S.events.push(newEvent({ title: d.title, ctx: d.ctx, date: d.date, start: d.time, dur: d.dur, location: d.location })); save();
+          if (ui.cap === c) { c.saved = `Saved in Pit Wall only (Google said: ${err.message})`; render(); }
+        });
+        return;
+      }
+      S.events.push(newEvent({ title: d.title, ctx: d.ctx, date: d.date, start: d.time, dur: d.dur, location: d.location })); msg = `Added to ${relDay(d.date)} at ${hm(d.time)}`;
+    }
     else if (d.type === 'note') { const txt = parse(c.text).title || c.text.trim(); if (!txt) { toast('Type something first'); return; } S.notes.push({ id: uid(), text: txt, ctx: d.ctx, created: Date.now() }); msg = 'Saved to Notes'; }
     else { S.waiting.push({ id: uid(), who: d.who, what: d.title, via: 'email', ctx: d.ctx, sent: today(), expect: d.date, nudged: null, done: false }); msg = 'Added to Waiting on'; }
     save(); c.saved = msg + ' · ' + LABEL[d.ctx]; render();
@@ -843,9 +1058,9 @@ const A = {
   planDrop: (el) => { if (ui.plan.sel) schedule(ui.plan.sel, +el.dataset.v); },
   planAll: () => { ui.plan.all = !ui.plan.all; render(); },
   /* trip */
-  tripMode: (el) => { const e = byId(S.events, ui.route.id); e.travel.mode = el.dataset.v; save(); render(); },
-  tripMin: (el) => { const e = byId(S.events, ui.route.id); const m = e.travel.mode; const cur = e.travel.mins[m]; e.travel.mins[m] = Math.max(5, (cur == null ? 15 : cur) + (cur == null ? 0 : +el.dataset.v)); save(); render(); },
-  tripEarly: (el) => { const e = byId(S.events, ui.route.id); e.early = +el.dataset.v; save(); render(); },
+  tripMode: (el) => { const t = travelTarget(findEvent(ui.route.id)); t.travel.mode = el.dataset.v; save(); render(); },
+  tripMin: (el) => { const t = travelTarget(findEvent(ui.route.id)); const m = t.travel.mode; const cur = t.travel.mins[m]; t.travel.mins[m] = Math.max(5, (cur == null ? 15 : cur) + (cur == null ? 0 : +el.dataset.v)); save(); render(); },
+  tripEarly: (el) => { const t = travelTarget(findEvent(ui.route.id)); t.early = +el.dataset.v; save(); render(); },
   /* weekend */
   wkDay: (el) => { ui.wkDay = +el.dataset.v; render(); },
   wkToggleList: (el) => { ui.wkOpen = ui.wkOpen === el.dataset.id ? null : el.dataset.id; render(); },
@@ -880,8 +1095,21 @@ const F = {
     ui.sheet = null; save(); render();
   },
   saveEvent: (f) => {
-    const e = byId(S.events, f.dataset.id);
+    const e = findEvent(f.dataset.id);
     const [h, m] = fv(f, 'start').split(':').map(Number);
+    if (e.g) {
+      const a = acctById(e.g.acct); const date = fv(f, 'date'); const st = h * 60 + m; const d2 = +fv(f, 'dur');
+      const startD = fromISO(date); startD.setMinutes(st); const endD = new Date(startD.getTime() + d2 * 60000);
+      const payload = { cal: e.g.cal, eid: e.g.eid, origStart: e.g.origStart, title: fv(f, 'title').trim() || e.title, location: fv(f, 'location').trim(), start: startD.toISOString(), end: endD.toISOString() };
+      const list = G.events[a.id] || []; const raw = list.find((x) => x.eid === e.g.eid && x.start === e.g.origStart);
+      const before = raw ? Object.assign({}, raw) : null;
+      if (raw) Object.assign(raw, { title: payload.title, location: payload.location, start: payload.start, end: payload.end });
+      const newId = 'g:' + a.id + ':' + e.g.eid + ':' + startD.getTime();
+      if (S.meta[e.id] && newId !== e.id) { S.meta[newId] = S.meta[e.id]; delete S.meta[e.id]; }
+      saveG(); save(); ui.sheet = { type: 'event', id: newId }; render();
+      call(a, 'updateEvent', payload, true).then(() => toast('Saved to Google Calendar')).catch((err) => { if (raw && before) Object.assign(raw, before); saveG(); ui.sheet = null; render(); toast('Couldn’t save: ' + err.message); });
+      return;
+    }
     Object.assign(e, { title: fv(f, 'title').trim() || e.title, ctx: fv(f, 'ctx'), date: fv(f, 'date'), start: h * 60 + m, dur: +fv(f, 'dur'), location: fv(f, 'location').trim() });
     ui.sheet = { type: 'event', id: e.id }; save(); render();
   },
@@ -891,7 +1119,7 @@ const F = {
     ui.sheet = null; save(); render();
   },
   mkCreate: (f) => {
-    const m = byId(S.messages, f.dataset.id); const sh = ui.sheet;
+    const m = findMsg(f.dataset.id); const sh = ui.sheet;
     const proj = parse((m.subj || '') + ' ' + m.body, { projects: projectNames() }).project;
     let n = 0;
     sh.items.forEach((it, i) => {
@@ -900,6 +1128,42 @@ const F = {
     });
     if (!n) { toast('Tick at least one'); return; }
     sh.done = n; save(); render();
+  },
+  gConnect: async (f) => {
+    const parsed = parseLink(fv(f, 'link'));
+    const key = (parsed && parsed.key) || fv(f, 'key').trim();
+    const sh = ui.sheet;
+    if (!parsed || !/^https:\/\/script\.google(usercontent)?\.com\//.test(parsed.url)) { sh.error = 'That doesn’t look like a Google Apps Script web app link (it should start with https://script.google.com/macros/s/…).'; render(); return; }
+    if (!key) { sh.error = 'Add the key — either at the end of the link (?key=…) or in the Key box.'; render(); return; }
+    const ctx = fv(f, 'ctx') || 'personal';
+    sh.error = null; sh.busy = true; render();
+    try {
+      const acct = { id: uid(), url: parsed.url, key, ctx, mail: true, email: '', cals: {}, writeCal: {} };
+      const d = await call(acct, 'ping');
+      acct.email = d.email;
+      const primary = d.calendars.find((c) => c.primary) || d.calendars[0];
+      d.calendars.forEach((c) => { acct.cals[c.id] = { name: c.name, ctx, show: !!(c.owned || c.primary) }; });
+      if (primary) acct.writeCal = { work: primary.id, personal: primary.id };
+      S.accounts.push(acct); save();
+      ui.sheet = { type: 'gacct', id: acct.id, fresh: true }; render();
+      syncAccount(acct).then(() => { if (!ui.sheet || ui.sheet.id === acct.id) render(); });
+    } catch (err) {
+      sh.busy = false; sh.error = err.message === 'Wrong or missing key' ? 'The connector rejected the key. Check it matches the KEY in your script.' : (err.message || 'Couldn’t connect.'); render();
+    }
+  },
+  saveAcct: (f) => {
+    const a = acctById(f.dataset.id); if (!a) return;
+    a.ctx = fv(f, 'ctx') || a.ctx;
+    a.mail = fc(f, 'mail');
+    Object.keys(a.cals).forEach((id, i) => { a.cals[id].show = fc(f, 'show' + i); a.cals[id].ctx = fv(f, 'cctx' + i) || a.cals[id].ctx; });
+    a.writeCal = { work: fv(f, 'wcw') || null, personal: fv(f, 'wcp') || null };
+    save(); ui.sheet = null; render(); toast('Saved · syncing');
+    syncAccount(a).then(render);
+  },
+  sendReply: (f) => {
+    const m = findMsg(f.dataset.id); const body = fv(f, 'body').trim(); if (!m || !body) return;
+    const a = acctById(m.g.acct); const btn = f.querySelector('button.primary'); if (btn) { btn.disabled = true; btn.textContent = 'Sending…'; }
+    call(a, 'reply', { id: m.g.tid, body }, true).then(() => { ui.sheet = null; render(); toast('Reply sent'); }).catch((err) => { if (btn) { btn.disabled = false; btn.textContent = 'Send'; } toast('Couldn’t send: ' + err.message); });
   },
   wkAdd: (f) => {
     const v = fv(f, 't').trim(); if (!v) return;
@@ -955,7 +1219,7 @@ function parseHash() {
   const h = location.hash.replace(/^#\/?/, '');
   const [path, q] = h.split('?');
   const parts = path.split('/').filter(Boolean);
-  return { name: parts[0] || 'today', id: parts[1] || null, q: new URLSearchParams(q || '') };
+  return { name: parts[0] || 'today', id: parts[1] ? decodeURIComponent(parts[1]) : null, q: new URLSearchParams(q || '') };
 }
 function go(h) { if (location.hash === h) render(); else location.hash = h; }
 function render() {
@@ -1002,3 +1266,15 @@ document.addEventListener('visibilitychange', () => { if (!document.hidden) { if
 
 if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
 render();
+
+function bgSync() {
+  if (!S.accounts.length || isSyncing()) return;
+  syncAll().then(() => {
+    const a = document.activeElement;
+    if (document.hidden || drag.active || ui.sheet || (a && /INPUT|TEXTAREA|SELECT/.test(a.tagName))) return;
+    render();
+  });
+}
+bgSync();
+setInterval(() => { if (!document.hidden) bgSync(); }, 5 * 60000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden && Date.now() - lastSync() > 2 * 60000) bgSync(); });

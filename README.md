@@ -11,3 +11,8 @@ Everything is stored on the device (browser storage). No account, no server.
 
 ## Hosting
 Static files only — served by GitHub Pages from the `main` branch root.
+
+## Gmail and Google Calendar
+Pit Wall connects to Google through a small Apps Script that runs in *your own* Google account
+(`google/PitWallConnector.gs`). Your phone talks to that script directly; no third-party server.
+Setup steps are at the top of the script. In the app: More → Google accounts → Connect.
