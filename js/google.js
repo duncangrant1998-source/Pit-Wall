@@ -1,6 +1,7 @@
 // Talks to the user's own Pit Wall connector (an Apps Script web app in their Google account).
 import { S } from './store.js';
 import { today, addDays, fromISO } from './util.js';
+import { msCall } from './ms.js';
 
 const GKEY = 'pitwall.google.v1';
 export const G = { events: {}, threads: {}, bodies: {}, waiting: {}, sync: {} };
@@ -34,6 +35,7 @@ export function parseLink(text) {
 }
 
 export async function call(acct, action, params = {}, post = false) {
+  if (acct.type === 'ms') return msCall(acct, action, params);
   const p = Object.assign({ key: acct.key, action }, params);
   let res;
   if (post) {

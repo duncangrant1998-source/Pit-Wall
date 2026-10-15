@@ -16,3 +16,11 @@ Static files only — served by GitHub Pages from the `main` branch root.
 Pit Wall connects to Google through a small Apps Script that runs in *your own* Google account
 (`google/PitWallConnector.gs`). Your phone talks to that script directly; no third-party server.
 Setup steps are at the top of the script. In the app: More → Google accounts → Connect.
+
+## Outlook / Microsoft 365
+Pit Wall signs in to Microsoft directly (OAuth 2.0 with PKCE, Microsoft Graph). Register an app in
+Microsoft Entra: *Single-page application* redirect URI = the address you open Pit Wall at (for example
+`https://duncangrant1998-source.github.io/Pit-Wall/`), delegated Graph permissions `User.Read`,
+`Mail.ReadWrite`, `Mail.Send`, `Calendars.ReadWrite`, `offline_access`. Paste the Application (client) ID
+into More → Email & calendar accounts → Outlook. Microsoft limits browser-app sign-ins to 24 hours, so
+Pit Wall asks for a quick sign-in once a day.

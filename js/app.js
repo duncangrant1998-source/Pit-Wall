@@ -1,5 +1,6 @@
 import { esc, uid, cap, iso, today, addDays, diffDays, nowMin, hm, weekStart, fromISO, dayShort, dayLong, relDay, dur, durShort, icon, mk, WD, MONL } from './util.js';
 import { G, loadG, saveG, call, syncAll, syncAccount, isSyncing, lastSync, syncErrors, parseLink, forgetAccount } from './google.js';
+import { startSignIn, handleRedirect, tenantFromEmail, adminConsentLink, redirectUri, msCall } from './ms.js';
 import { S, load, save, replaceAll, reset, removeSamples, hasSamples, projects, projectNames, newTask, newEvent } from './store.js';
 import { parse, detectActions, resolveDay } from './parse.js';
 
@@ -123,9 +124,22 @@ function taskRow(t, o = {}) {
 
 function syncBanner() {
   if (!S.accounts.length) return '';
+  const ms = S.accounts.find((a) => a.type === 'ms' && a.needsSignIn);
+  if (ms) return signInBanner(ms);
   const errs = syncErrors();
   if (errs.length) return `<p class="banner" style="margin-top:6px;border-color:#6A3A2E;color:var(--alert)">Couldn’t reach ${esc(errs[0].acct.email || 'Google')}: ${esc(errs[0].error)}</p>`;
   return `<p class="xs muted mono" style="padding-top:8px">${isSyncing() ? 'SYNCING…' : 'SYNCED ' + ago(lastSync()).toUpperCase()}</p>`;
+}
+function signInBanner(a) {
+  return `<div class="banner rowx g10" style="margin-top:6px;border-style:solid;border-color:#5A3F22;background:#2A1F14"><span class="grow small" style="color:var(--text)">Outlook needs a quick sign-in. Microsoft asks once a day.</span><button type="button" class="btn sm primary" data-a="msReauth" data-id="${a.id}">Sign in</button></div>`;
+}
+function msErrorText(err) {
+  const e = String(err || '');
+  if (/AADSTS50011|redirect/i.test(e)) return 'The redirect address doesn’t match your app registration. In Authentication, add ' + redirectUri() + ' as a Single-page application redirect URI.';
+  if (/AADSTS700016|not found in the directory/i.test(e)) return 'Microsoft couldn’t find that Application (client) ID in your company’s directory. Check you copied it from the Overview page.';
+  if (/AADSTS9002326|Single-Page Application/i.test(e)) return 'The redirect URI is set up as “Web”. Change its platform to “Single-page application”.';
+  if (/AADSTS65001|AADSTS90094|AADSTS90008|consent|approval|administrator/i.test(e)) return 'Your company needs to approve Pit Wall before it can read your mail. Send the link below to your IT company, then sign in again.';
+  return e;
 }
 function gTarget(ctx) {
   const accts = S.accounts.filter((a) => a.writeCal && a.writeCal[ctx]);
@@ -190,6 +204,7 @@ VIEWS.today = () => {
       <header class="hd"><div class="stack g4"><span class="eyebrow">${dayLong(T)}</span><h1 class="h1">Today</h1></div>
       <div class="rowx g8"><a class="avatar" href="#/more" aria-label="More and settings">${icon('person', 22, 2)}</a></div></header>
       ${ctxSeg(ctx, 'setCtx')}
+      ${S.accounts.some((a) => a.needsSignIn) ? signInBanner(S.accounts.find((a) => a.needsSignIn)) : ''}
       ${tripHTML}
       ${nextHTML}
       <section class="tiles" aria-label="Communications">${tile('mail', cnt.email, 'Unread email')}${tile('text', cnt.text, 'New texts')}${tile('phone', cnt.call, 'Missed calls', true)}</section>
@@ -337,7 +352,7 @@ VIEWS.inbox = () => {
       ${seg([{ id: 'all', label: 'All', count: c('all') }, { id: 'email', label: 'Email', count: c('email') }, { id: 'text', label: 'Texts', count: c('text') }, { id: 'call', label: 'Calls', count: c('call') }], ui.inboxFilter, 'inboxFilter', 4, 'aria-label="Show"')}</div>
       <main class="main" style="padding-top:0;gap:0">
       ${syncBanner()}
-      ${sample ? `<p class="banner" style="margin-top:6px">${S.accounts.length ? 'Sample messages are mixed in with your email. Remove them in More → Remove sample data.' : 'These are sample messages so you can try things out. Connect Gmail in More → Google accounts.'} iPhone doesn’t let any app read your texts or call history.</p>` : ''}
+      ${sample ? `<p class="banner" style="margin-top:6px">${S.accounts.length ? 'Sample messages are mixed in with your email. Remove them in More → Remove sample data.' : 'These are sample messages so you can try things out. Connect Gmail or Outlook in More → Email & calendar accounts.'} iPhone doesn’t let any app read your texts or call history.</p>` : ''}
       <div id="inboxList">${msgRows()}</div></main>`,
   };
 };
@@ -379,10 +394,10 @@ function gMessageView(m) {
   const msgs = th ? th.msgs : [];
   const earlier = msgs.slice(0, -1), last = msgs[msgs.length - 1];
   return {
-    html: `<div class="topbar">${backLink('#/inbox', 'Inbox')}<div class="rowx g4"><a class="icon-btn plain" href="https://mail.google.com/mail/u/0/#all/${esc(m.g.tid)}" aria-label="Open in Gmail">${icon('mail', 20)}</a>
+    html: `<div class="topbar">${backLink('#/inbox', 'Inbox')}<div class="rowx g4"><a class="icon-btn plain" href="${esc(raw && raw.link ? raw.link : 'https://mail.google.com/mail/u/0/#all/' + m.g.tid)}" aria-label="${a.type === 'ms' ? 'Open in Outlook' : 'Open in Gmail'}">${icon('mail', 20)}</a>
       <button type="button" class="icon-btn plain" data-a="archiveMsg" data-id="${esc(m.id)}" aria-label="Archive">${icon('archive', 20)}</button></div></div>
     <main class="main" style="padding-top:8px">
-      <div class="stack g10"><span class="rowx g8 xs b t2">${mk(m.ctx)}${LABEL[m.ctx]} · ${esc(a.email || 'Gmail')}${acts.length ? ` · ${acts.length} request${acts.length > 1 ? 's' : ''} found` : ''}</span>
+      <div class="stack g10"><span class="rowx g8 xs b t2">${mk(m.ctx)}${LABEL[m.ctx]} · ${esc(a.email || (a.type === 'ms' ? 'Outlook' : 'Gmail'))}${acts.length ? ` · ${acts.length} request${acts.length > 1 ? 's' : ''} found` : ''}</span>
       <h1 style="font-size:24px;line-height:1.2;font-weight:700;font-stretch:110%">${esc(m.subj)}</h1></div>
       ${earlier.length ? `<details class="card" style="padding:12px 14px;border-radius:14px"><summary class="small b" style="cursor:pointer">${earlier.length} earlier message${earlier.length > 1 ? 's' : ''}</summary>
         <div class="stack g14" style="margin-top:12px">${earlier.map((x) => `<div class="stack g6"><span class="xs muted">${esc(parseFrom(x.from).name)} · ${relDay(iso(new Date(x.date)))}</span><div class="small" style="white-space:pre-wrap;line-height:1.5;color:var(--text2)">${esc(x.body.slice(0, 1500))}</div></div>`).join('')}</div></details>` : ''}
@@ -423,9 +438,9 @@ VIEWS.more = () => {
         ${tile('', 'person', 'Contacts', 'Work and personal', true)}
         ${tile('', 'folder', 'Files', 'Attachments', true)}
       </section>
-      <section class="stack g10" aria-label="Google accounts"><h2 class="h2">Google accounts</h2>
-        ${S.accounts.map((a) => { const st = G.sync[a.id] || {}; return `<button type="button" class="card rowx g12" style="padding:14px 16px;border-radius:16px;text-align:left" data-a="openAcct" data-id="${a.id}">${mk(a.ctx)}<span class="grow stack g4" style="min-width:0"><span class="b ellip">${esc(a.email || 'Google account')}</span><span class="small ${st.error ? '' : 'muted'}" style="${st.error ? 'color:var(--alert)' : ''}">${st.error ? 'Problem: ' + esc(st.error) : 'Gmail + Calendar · synced ' + ago(st.at)}</span></span>${icon('right', 18, 2)}</button>`; }).join('')}
-        <div class="${S.accounts.length ? 'grid2' : 'stack'}"><button type="button" class="btn" data-a="gConnect">${icon('plus', 18, 2)}${S.accounts.length ? 'Add account' : 'Connect Gmail and Calendar'}</button>${S.accounts.length ? `<button type="button" class="btn" data-a="syncNow">${icon('refresh', 18, 2)}Sync now</button>` : ''}</div>
+      <section class="stack g10" aria-label="Email and calendar accounts"><h2 class="h2">Email &amp; calendar accounts</h2>
+        ${S.accounts.map((a) => { const st = G.sync[a.id] || {}; return `<button type="button" class="card rowx g12" style="padding:14px 16px;border-radius:16px;text-align:left" data-a="openAcct" data-id="${a.id}">${mk(a.ctx)}<span class="grow stack g4" style="min-width:0"><span class="b ellip">${esc(a.email || 'Google account')}</span><span class="small ${st.error || a.needsSignIn ? '' : 'muted'}" style="${st.error || a.needsSignIn ? 'color:var(--alert)' : ''}">${a.needsSignIn ? 'Sign-in needed' : st.error ? 'Problem: ' + esc(st.error) : (a.type === 'ms' ? 'Outlook' : 'Gmail') + ' + Calendar · synced ' + ago(st.at)}</span></span>${icon('right', 18, 2)}</button>`; }).join('')}
+        <div class="${S.accounts.length ? 'grid2' : 'stack'}"><button type="button" class="btn" data-a="gConnect">${icon('plus', 18, 2)}${S.accounts.length ? 'Add account' : 'Connect email and calendar'}</button>${S.accounts.length ? `<button type="button" class="btn" data-a="syncNow">${icon('refresh', 18, 2)}Sync now</button>` : ''}</div>
       </section>
       <section class="stack" aria-label="Work and personal"><h2 class="h2" style="margin-bottom:4px">Work / personal split</h2>
         <div class="swrow"><div class="grow stack g4"><span id="sw-auto" class="b">Auto-switch by work hours</span><span class="small muted" style="line-height:1.35">Mon–Fri 08:00–18:00 opens on Work; evenings and weekends open on Personal</span></div>
@@ -894,7 +909,26 @@ function wkSheet() {
 }
 
 function gConnectSheet(sh) {
+  const prov = sh.prov || 'google';
+  const provSeg = seg([{ id: 'google', label: 'Gmail' }, { id: 'ms', label: 'Outlook / Microsoft 365' }], prov, 'connProv', 2, 'aria-label="Account type"');
+  if (prov === 'ms') {
+    const d = sh.draft || {};
+    const link = d.clientId ? adminConsentLink(d.tenant || tenantFromEmail(d.email), d.clientId) : '';
+    return `${sheetHead('Connect Outlook', 'Microsoft 365 mail and calendar')}
+    ${provSeg}
+    <form class="stack g14" data-f="msConnect">
+      <p class="small muted" style="line-height:1.45">Register Pit Wall in your company’s Microsoft account first, then paste its Application (client) ID here. Microsoft asks you to sign in again once a day.</p>
+      <div class="field"><label class="lbl" for="mse">Work email</label><input id="mse" name="email" type="email" class="input" value="${esc(d.email || '')}" placeholder="you@company.com" autocomplete="email" autocapitalize="off" spellcheck="false"></div>
+      <div class="field"><label class="lbl" for="msc">Application (client) ID</label><input id="msc" name="client" class="input" value="${esc(d.clientId || '')}" placeholder="00000000-0000-0000-0000-000000000000" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" style="font-family:var(--mono);font-size:14px"></div>
+      ${ctxPicker(d.ctx || 'work').replace('>Category<', '>This account is mostly<')}
+      ${sh.error ? `<p class="small" style="color:var(--alert);line-height:1.4" role="alert">${esc(msErrorText(sh.error))}</p>` : ''}
+      ${sh.consent && link ? `<div class="card stack g8" style="padding:14px;border-radius:14px"><span class="b">Approval link for your IT company</span><span class="small muted">An administrator opens it once and clicks Accept.</span><input class="input" readonly value="${esc(link)}" style="font-size:12px;font-family:var(--mono)" aria-label="Approval link"><button type="button" class="btn sm" data-a="copyText" data-v="${esc(link)}">Copy link</button></div>` : ''}
+      <button class="btn primary" style="height:54px">Sign in with Microsoft</button>
+      <p class="xs muted" style="line-height:1.4">Redirect URI for your app registration: <span class="mono">${esc(redirectUri())}</span></p>
+    </form>`;
+  }
   return `${sheetHead('Connect Google', 'Gmail and Calendar, through your own private connector')}
+  ${provSeg}
   <form class="stack g14" data-f="gConnect">
     <p class="small muted" style="line-height:1.45">First set up the Pit Wall connector in your Google account (see google/PitWallConnector.gs in the Pit-Wall repo). Then paste its link here.</p>
     <div class="field"><label class="lbl" for="gl">Connection link</label><textarea id="gl" name="link" class="input" style="min-height:96px;font-size:15px;font-weight:400" placeholder="https://script.google.com/macros/s/…/exec?key=…" autocapitalize="off" autocorrect="off" spellcheck="false"></textarea></div>
@@ -912,7 +946,7 @@ function gAcctSheet(sh) {
   return `${sheetHead(a.email || 'Google account', sh.fresh ? 'Connected. Pick which calendars to show.' : (st.error ? 'Problem: ' + esc(st.error) : 'Synced ' + ago(st.at)))}
   <form class="stack g14" data-f="saveAcct" data-id="${a.id}">
     ${ctxPicker(a.ctx).replace('>Category<', '>Email from this account counts as<')}
-    <label class="swrow" style="cursor:pointer"><span class="grow stack g4"><span class="b">Show Gmail inbox</span><span class="small muted">Latest 30 conversations</span></span><input type="checkbox" name="mail" ${a.mail !== false ? 'checked' : ''} style="width:24px;height:24px;accent-color:#F2F0EB"></label>
+    <label class="swrow" style="cursor:pointer"><span class="grow stack g4"><span class="b">${a.type === 'ms' ? 'Show Outlook inbox' : 'Show Gmail inbox'}</span><span class="small muted">Latest 30 conversations</span></span><input type="checkbox" name="mail" ${a.mail !== false ? 'checked' : ''} style="width:24px;height:24px;accent-color:#F2F0EB"></label>
     <div class="field"><span class="lbl">Calendars</span>
       ${ids.map((id, i) => `<div class="rowx g10" style="padding:8px 0;border-bottom:1px solid var(--line2)">
         <label class="rowx g10 grow" style="min-width:0;min-height:40px;cursor:pointer"><input type="checkbox" name="show${i}" ${a.cals[id].show !== false ? 'checked' : ''} style="width:22px;height:22px;flex:none;accent-color:#F2F0EB"><span class="ellip">${esc(a.cals[id].name)}</span></label>
@@ -920,6 +954,7 @@ function gAcctSheet(sh) {
     </div>
     <div class="grid2"><div class="field"><label class="lbl" for="wcw">New work events</label><select id="wcw" name="wcw" class="input" style="font-size:14px">${opts(a.writeCal && a.writeCal.work)}</select></div>
     <div class="field"><label class="lbl" for="wcp">New personal events</label><select id="wcp" name="wcp" class="input" style="font-size:14px">${opts(a.writeCal && a.writeCal.personal)}</select></div></div>
+    ${a.type === 'ms' ? `<div class="card stack g8" style="padding:12px 14px;border-radius:14px"><span class="small"><b>Microsoft 365</b> · ${a.needsSignIn ? '<span style="color:var(--alert)">sign-in needed</span>' : 'signed in'}. Microsoft asks you to sign in again once a day.</span>${sh.msError ? `<span class="small" style="color:var(--alert);line-height:1.4">${esc(msErrorText(sh.msError))}</span>` : ''}<button type="button" class="btn sm" data-a="msReauth" data-id="${a.id}">Sign in again</button></div>` : ''}
     ${sh.fresh && hasSamples() ? `<button type="button" class="btn" data-a="removeSamplesNow">Remove the sample data</button>` : ''}
     <div class="rowx g8"><button type="button" class="btn danger" data-a="disconnect" data-id="${a.id}">Disconnect</button><button class="btn primary wide">Save</button></div>
   </form>`;
@@ -988,6 +1023,9 @@ const A = {
   },
   syncNow: () => { toast('Syncing…'); syncAll().then(() => { render(); const e = syncErrors(); toast(e.length ? 'Sync problem: ' + e[0].error : 'Up to date'); }); render(); },
   gConnect: () => { ui.sheet = { type: 'gconnect' }; render(); },
+  connProv: (el) => { ui.sheet.prov = el.dataset.v; ui.sheet.error = null; ui.sheet.consent = false; render(); },
+  copyText: (el) => { const v = el.dataset.v; (navigator.clipboard ? navigator.clipboard.writeText(v) : Promise.reject()).then(() => toast('Copied')).catch(() => toast('Press and hold the link to copy it')); },
+  msReauth: (el) => { const a = acctById(el.dataset.id); if (!a) return; startSignIn({ email: a.email, clientId: a.clientId, tenant: a.tenant, ctx: a.ctx }, a.id); },
   openAcct: (el) => { ui.sheet = { type: 'gacct', id: el.dataset.id }; render(); },
   disconnect: (el) => {
     const a = acctById(el.dataset.id); if (!a || !confirm('Disconnect ' + (a.email || 'this account') + '? Its email and events disappear from Pit Wall (nothing is deleted in Google).')) return;
@@ -1012,7 +1050,7 @@ const A = {
   resetApp: () => { if (confirm('Erase everything on this phone and start again with the sample data? Your Google connections stay.')) { reset(); render(); toast('App reset'); } },
   exportData: async () => {
     const name = `pitwall-backup-${today()}.json`;
-    const blob = new Blob([JSON.stringify(S, null, 2)], { type: 'application/json' });
+    const blob = new Blob([JSON.stringify(S, (k, v) => (k === 'tok' ? undefined : v), 2)], { type: 'application/json' });
     try {
       const file = new File([blob], name, { type: 'application/json' });
       if (navigator.canShare && navigator.canShare({ files: [file] })) { await navigator.share({ files: [file], title: 'Pit Wall backup' }); return; }
@@ -1128,6 +1166,14 @@ const F = {
     });
     if (!n) { toast('Tick at least one'); return; }
     sh.done = n; save(); render();
+  },
+  msConnect: (f) => {
+    const email = fv(f, 'email').trim(), clientId = fv(f, 'client').trim().toLowerCase(), ctx = fv(f, 'ctx') || 'work';
+    const sh = ui.sheet;
+    sh.draft = { email, clientId, ctx, tenant: tenantFromEmail(email) };
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) { sh.error = 'Enter your work email address.'; render(); return; }
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(clientId)) { sh.error = 'The Application (client) ID is a 36-character code like 1a2b3c4d-…. Copy it from your app registration’s Overview page.'; render(); return; }
+    startSignIn(sh.draft);
   },
   gConnect: async (f) => {
     const parsed = parseLink(fv(f, 'link'));
@@ -1265,7 +1311,33 @@ setInterval(tick, 60000);
 document.addEventListener('visibilitychange', () => { if (!document.hidden) { if (S.settings.autoSwitch && ui.ctx !== 'all') ui.ctx = autoCtx(); tick(); } });
 
 if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
+
+async function msInit() {
+  let r;
+  try { r = await handleRedirect(); } catch (e) { r = { error: e.message }; }
+  if (!r) return;
+  if (r.error) {
+    ui.sheet = r.acctId ? { type: 'gacct', id: r.acctId, msError: r.error } : { type: 'gconnect', prov: 'ms', error: r.error, consent: !!r.consent, draft: r.draft };
+    return;
+  }
+  if (r.acctId) { const a = acctById(r.acctId); if (a) { a.tok = r.tok; a.needsSignIn = false; save(); ui.afterToast = 'Signed in to Outlook'; } return; }
+  const a = { type: 'ms', id: uid(), clientId: r.draft.clientId, tenant: r.draft.tenant, email: r.draft.email, ctx: r.draft.ctx || 'work', mail: true, cals: {}, writeCal: {}, tok: r.tok };
+  try {
+    const d = await msCall(a, 'ping');
+    a.email = d.email || a.email;
+    const primary = d.calendars.find((c) => c.primary) || d.calendars[0];
+    d.calendars.forEach((c) => { a.cals[c.id] = { name: c.name, ctx: a.ctx, show: !!(c.primary || (c.owned && !/birthday|holiday/i.test(c.name))) }; });
+    if (primary) a.writeCal = { work: primary.id, personal: primary.id };
+  } catch (e) {
+    ui.sheet = { type: 'gconnect', prov: 'ms', error: 'Signed in, but couldn’t read your mailbox: ' + e.message, draft: r.draft };
+    return;
+  }
+  S.accounts.push(a); save();
+  ui.sheet = { type: 'gacct', id: a.id, fresh: true };
+}
+await msInit();
 render();
+if (ui.afterToast) { toast(ui.afterToast); ui.afterToast = null; }
 
 function bgSync() {
   if (!S.accounts.length || isSyncing()) return;

@@ -1,8 +1,8 @@
 // Pit Wall service worker: app shell works offline; fonts cached on first use.
-const VERSION = 'pitwall-v2';
+const VERSION = 'pitwall-v3';
 const SHELL = [
-  './', './index.html', './styles.css?v=2', './manifest.webmanifest',
-  './js/app.js?v=2', './js/util.js', './js/store.js', './js/parse.js', './js/google.js',
+  './', './index.html', './styles.css?v=3', './manifest.webmanifest',
+  './js/app.js?v=3', './js/util.js', './js/store.js', './js/parse.js', './js/google.js', './js/ms.js',
   './icons/icon.png',
 ];
 
